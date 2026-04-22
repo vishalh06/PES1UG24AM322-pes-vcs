@@ -121,8 +121,32 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
     mkdir(shard_dir, 0755);
 
+    /* Step 5: Get the final object path */
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    /* Step 6: Write to a temp file first */
+    char tmp[520];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) { free(full); return -1; }
+    if (write(fd, full, full_len) != (ssize_t)full_len) {
+        close(fd); free(full); return -1;
+    }
+
+    /* Step 7: fsync to flush data to disk */
+    fsync(fd);
+    close(fd);
     free(full);
-    return -1; /* not finished yet */
+
+    /* Step 8: Atomic rename temp -> final path */
+    if (rename(tmp, path) != 0) return -1;
+
+    /* Step 9: fsync the directory to persist the rename */
+    int dfd = open(shard_dir, O_RDONLY);
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
+
+    return 0;
 }
 
 // Read an object from the store.
