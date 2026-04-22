@@ -10,6 +10,8 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h" 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +35,7 @@ uint32_t get_file_mode(const char *path) {
     if (st.st_mode & S_IXUSR) return MODE_EXEC;
     return MODE_FILE;
 }
-
+int object_write(int type, const void *data, size_t len, ObjectID *id_out);
 // Parse binary tree data into a Tree struct safely.
 // Returns 0 on success, -1 on parse error.
 int tree_parse(const void *data, size_t len, Tree *tree_out) {
@@ -129,9 +131,120 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
-int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+/* Local struct to hold raw index entries read from .pes/index file.
+   We avoid including index.h so that test_tree can link without index.o */
+typedef struct {
+    uint32_t mode;
+    ObjectID hash;
+    char     path[512];
+} RawEntry;
+
+/* Forward declaration of the recursive helper we will implement next */
+static int write_tree_level(RawEntry *entries, int count, const char *prefix, ObjectID *id_out);
+static int write_tree_level(RawEntry *entries, int count, const char *prefix, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    int i = 0;
+    while (i < count) {
+        /* Strip the prefix to get the name relative to this level */
+        const char *rel = entries[i].path + strlen(prefix);
+        char *slash = strchr(rel, '/');
+
+        if (!slash) {
+            /* Regular file at this directory level — add directly */
+            TreeEntry *e = &tree.entries[tree.count++];
+            e->mode = entries[i].mode;
+            snprintf(e->name, sizeof(e->name), "%s", rel);
+            e->name[sizeof(e->name) - 1] = '\0';
+            e->hash = entries[i].hash;
+            i++;
+        } else {
+
+            /* This entry is inside a subdirectory e.g. "src/main.c" */
+            char subdir[256] = {0};
+            size_t subdir_len = (size_t)(slash - rel);
+            if (subdir_len >= sizeof(subdir)) { i++; continue; }
+            memcpy(subdir, rel, subdir_len);
+
+            /* Build the full prefix for this subdirectory e.g. "src/" */
+            char full_sub[512];
+            snprintf(full_sub, sizeof(full_sub), "%s%s/", prefix, subdir);
+            size_t full_sub_len = strlen(full_sub);
+
+            /* Find all entries that belong to this subdirectory */
+            int j = i;
+            while (j < count &&
+                   strncmp(entries[j].path, full_sub, full_sub_len) == 0) {
+                j++;
+            }
+
+            /* Avoid adding the same subdirectory twice */
+            int already_added = 0;
+            for (int k = 0; k < tree.count; k++) {
+                if (strcmp(tree.entries[k].name, subdir) == 0) {
+                    already_added = 1;
+                    break;
+                }
+            }
+
+            if (!already_added) {
+                /* Recursively build the subtree */
+                ObjectID sub_id;
+                if (write_tree_level(entries + i, j - i,
+                                     full_sub, &sub_id) != 0) return -1;
+                TreeEntry *e = &tree.entries[tree.count++];
+                e->mode = 0040000;
+                snprintf(e->name, sizeof(e->name), "%s", rel);
+                e->name[sizeof(e->name) - 1] = '\0';
+                e->hash = sub_id;
+            }
+            i = j;
+        }
+           
+        }
+
+    /* Serialize and write this tree to the object store */
+    void *tdata;
+    size_t tlen;
+    if (tree_serialize(&tree, &tdata, &tlen) != 0) return -1;
+    int ret = object_write(OBJ_TREE, tdata, tlen, id_out);
+    free(tdata);
+    return ret;
 }
+int tree_from_index(ObjectID *id_out) {
+    /* Open and parse .pes/index directly
+       Format per line: <mode-octal> <64-hex-hash> <mtime> <size> <path> */
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) {
+        fprintf(stderr, "error: nothing staged — run 'pes add' first\n");
+        return -1;
+    }
+
+    static RawEntry entries[10000];
+    int count = 0;
+
+    while (count < 10000) {
+        RawEntry *e = &entries[count];
+        char hex[HASH_HEX_SIZE + 2];
+        unsigned long mtime_discard;
+        unsigned int  size_discard;
+
+        int n = fscanf(f, "%o %64s %lu %u %511s",
+                       &e->mode, hex,
+                       &mtime_discard, &size_discard,
+                       e->path);
+        if (n != 5) break;
+        if (hex_to_hash(hex, &e->hash) != 0) break;
+        count++;
+    }
+    fclose(f);
+
+    if (count == 0) {
+        fprintf(stderr, "error: index is empty — nothing to commit\n");
+        return -1;
+    }
+
+    return write_tree_level(entries, count, "", id_out);
+}
+
