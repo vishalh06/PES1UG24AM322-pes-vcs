@@ -111,6 +111,16 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     /* Step 2: Compute SHA-256 hash of the full object */
     compute_hash(full, full_len, id_out);
 
+    /* Step 3: Deduplication - if object already exists, nothing to do */
+    if (object_exists(id_out)) { free(full); return 0; }
+
+    /* Step 4: Create shard directory e.g. .pes/objects/ab/ */
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+    char shard_dir[512];
+    snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
+    mkdir(shard_dir, 0755);
+
     free(full);
     return -1; /* not finished yet */
 }
